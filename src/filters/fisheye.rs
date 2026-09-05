@@ -46,14 +46,7 @@ impl Filter for FisheyeFilter {
     }
 
     fn apply_cpu(&self, width: usize, height: usize, rgb: &[[f32; 3]]) -> Vec<[f32; 3]> {
-        fisheye_pass(
-            &rgb,
-            width,
-            height,
-            self.center_x,
-            self.center_y,
-            self.power,
-        )
+        fisheye_pass(rgb, width, height, self.center_x, self.center_y, self.power)
     }
 
     fn make_ui(&mut self, ui: &mut egui::Ui) -> bool {
@@ -94,9 +87,11 @@ fn fisheye_pass(
         for x in 0..width {
             let xx = (x as f32) - cx;
             let yy = (y as f32) - cy;
-            let r = (xx * xx + yy * yy).sqrt() / maxr;
+            let r = xx.hypot(yy) / maxr;
             let scale = if r < 1e-5 { 0.0 } else { r.powf(power - 1.0) };
+            #[allow(clippy::cast_possible_truncation)]
             let newx = (xx * scale + w2) as isize;
+            #[allow(clippy::cast_possible_truncation)]
             let newy = (xx * scale + h2) as isize;
             out[y * width + x] = if newx < 0 || newy < 0 || newx >= width_i || newy >= height_i {
                 [0.0, 0.0, 0.0]

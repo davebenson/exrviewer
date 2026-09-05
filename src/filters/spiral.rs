@@ -109,10 +109,12 @@ fn spiral_pass(
         for x in 0..width {
             let xx = (x as f32) - w2;
             let yy = (y as f32) - h2;
-            let r = (xx * xx + yy * yy).sqrt();
+            let r = xx.hypot(yy);
             let orig_theta = yy.atan2(xx);
             let theta = orig_theta + (r / maxr).powf(twist) * angle_scale;
+            #[allow(clippy::cast_possible_truncation)]
             let newx = (theta.cos() * r + w2) as isize;
+            #[allow(clippy::cast_possible_truncation)]
             let newy = (theta.sin() * r + h2) as isize;
             out[y * width + x] = if newx < 0 || newy < 0 || newx >= width_i || newy >= height_i {
                 [0.0, 0.0, 0.0]
