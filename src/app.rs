@@ -231,8 +231,8 @@ impl LayerCompositorApp {
 
         egui_extras::TableBuilder::new(ui)
             .id_salt("layer_table")
-            .column(egui_extras::Column::exact(180.0).resizable(true))
-            .column(egui_extras::Column::exact(120.0).resizable(true))
+            .column(egui_extras::Column::initial(180.0).resizable(true))
+            .column(egui_extras::Column::initial(120.0).resizable(true))
             .column(egui_extras::Column::remainder().resizable(true))
             .max_scroll_height(200.0)
             .header(20.0, |mut header| {

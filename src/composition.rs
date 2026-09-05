@@ -119,6 +119,11 @@ impl Composition {
             .all_attributes()
             .from_file(path)?;
 
+        for (index, layer) in image.layer_data.iter().enumerate() {
+            for channel in &layer.channel_data.list {
+                eprintln!("layer[{}] = {}", index, channel.name);
+            }
+        }
         let layers: Vec<CompositionLayer> = image
             .layer_data
             .iter()

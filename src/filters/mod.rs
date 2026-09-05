@@ -19,6 +19,8 @@
 mod blur;
 mod brightness;
 mod invert;
+mod bw;
+mod spiral;
 
 /// A stateless descriptor for a *type* of filter: enough to list it in an
 /// "add filter" menu (`label`), build its GPU pipeline once (`shader`), and
@@ -64,7 +66,13 @@ pub trait Filter {
 }
 
 /// Every known filter kind, e.g. for populating an "add filter" menu.
-pub const ALL_KINDS: &[&dyn FilterKind] = &[&brightness::Brightness, &invert::Invert, &blur::Blur];
+pub const ALL_KINDS: &[&dyn FilterKind] = &[
+    &brightness::Brightness,
+    &invert::Invert,
+    &blur::Blur,
+    &bw::BW,
+    &spiral::Spiral,
+];
 
 /// A filter instance plus UI-only "expanded" state.
 ///
