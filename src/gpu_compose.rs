@@ -37,6 +37,8 @@
 //! (or clamp) pass, since a floating-point render target doesn't clamp on
 //! write the way a `Unorm` target does.
 
+use std::collections::HashMap;
+
 const ACCUMULATE_SHADER: &str = include_str!("shaders/accumulate.wgsl");
 const RESOLVE_SHADER: &str = include_str!("shaders/resolve.wgsl");
 const CLAMP_SHADER: &str = include_str!("shaders/clamp.wgsl");
@@ -102,9 +104,10 @@ pub struct GpuCompositor {
     resolve_pipeline: wgpu::RenderPipeline,
     clamp_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
-    brightness_pipeline: wgpu::RenderPipeline,
-    invert_pipeline: wgpu::RenderPipeline,
-    blur_pipeline: wgpu::RenderPipeline,
+    /// One pipeline per [`crate::filters::FilterKind`] (built from its
+    /// `shader()`), keyed by `label()`. Every `Filter` instance of a given
+    /// kind shares its pipeline; see `filter_pipeline`.
+    filter_pipelines: HashMap<&'static str, wgpu::RenderPipeline>,
     layers: Vec<GpuLayer>,
     targets: Option<Targets>,
 }
@@ -159,30 +162,20 @@ impl GpuCompositor {
             DISPLAY_FORMAT,
             None,
         );
-        let brightness_pipeline = create_pipeline(
-            device,
-            "brightness",
-            crate::filters::BRIGHTNESS_SHADER,
-            &[&sampler_bind_group_layout, &texture_uniform_layout],
-            ACCUM_FORMAT,
-            None,
-        );
-        let invert_pipeline = create_pipeline(
-            device,
-            "invert",
-            crate::filters::INVERT_SHADER,
-            &[&sampler_bind_group_layout, &texture_uniform_layout],
-            ACCUM_FORMAT,
-            None,
-        );
-        let blur_pipeline = create_pipeline(
-            device,
-            "blur",
-            crate::filters::BLUR_SHADER,
-            &[&sampler_bind_group_layout, &texture_uniform_layout],
-            ACCUM_FORMAT,
-            None,
-        );
+        let filter_pipelines = crate::filters::ALL_KINDS
+            .iter()
+            .map(|kind| {
+                let pipeline = create_pipeline(
+                    device,
+                    kind.label(),
+                    kind.shader(),
+                    &[&sampler_bind_group_layout, &texture_uniform_layout],
+                    ACCUM_FORMAT,
+                    None,
+                );
+                (kind.label(), pipeline)
+            })
+            .collect();
 
         Self {
             device: device.clone(),
@@ -194,9 +187,7 @@ impl GpuCompositor {
             resolve_pipeline,
             clamp_pipeline,
             blit_pipeline,
-            brightness_pipeline,
-            invert_pipeline,
-            blur_pipeline,
+            filter_pipelines,
             layers: Vec::new(),
             targets: None,
         }
@@ -379,12 +370,10 @@ impl GpuCompositor {
         }
     }
 
-    fn filter_pipeline(&self, kind: crate::FilterKind) -> &wgpu::RenderPipeline {
-        match kind {
-            crate::FilterKind::Brightness => &self.brightness_pipeline,
-            crate::FilterKind::Invert => &self.invert_pipeline,
-            crate::FilterKind::Blur => &self.blur_pipeline,
-        }
+    fn filter_pipeline(&self, filter: &dyn crate::Filter) -> &wgpu::RenderPipeline {
+        self.filter_pipelines
+            .get(filter.label())
+            .expect("filter instance's label doesn't match any registered FilterKind")
     }
 
     /// Runs one full-screen pass: binds `bind_group` (already wrapping
@@ -464,7 +453,7 @@ impl GpuCompositor {
     }
 
     /// Runs `filters` in order, each as one or more GPU passes (see
-    /// `FilterKind::stage_count`), ping-ponging between `first_dest` and
+    /// `Filter::stage_count`), ping-ponging between `first_dest` and
     /// `second_dest`. Returns whichever view holds the final result:
     /// `source` itself if `filters` is empty. `first_dest`/`second_dest`
     /// must both differ from `source` (they don't need to differ from each
@@ -474,7 +463,7 @@ impl GpuCompositor {
     fn run_filter_chain<'v>(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        filters: &[crate::Filter],
+        filters: &[crate::FilterEntry],
         size: (u32, u32),
         source: &'v wgpu::TextureView,
         first_dest: &'v wgpu::TextureView,
@@ -483,11 +472,12 @@ impl GpuCompositor {
         let mut current = source;
         let mut use_first = true;
 
-        for filter in filters {
-            let pipeline = self.filter_pipeline(filter.kind);
-            for stage in 0..filter.kind.stage_count() {
+        for entry in filters {
+            let filter = entry.filter.as_ref();
+            let pipeline = self.filter_pipeline(filter);
+            for stage in 0..filter.stage_count() {
                 let dest = if use_first { first_dest } else { second_dest };
-                let params = filter.kind.stage_params(filter.amount, stage, size);
+                let params = filter.stage_params(stage, size);
                 self.run_filter_stage(encoder, pipeline, current, params, dest);
                 current = dest;
                 use_first = !use_first;

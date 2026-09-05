@@ -3,23 +3,19 @@ use std::sync::Arc;
 
 use exr::prelude::*;
 
-use crate::filters::{self, Filter};
+use crate::filters::{self, FilterEntry};
 
 /// A single, decoded layer of an EXR file, holding its RGBA pixels as `f32`
 /// samples in `0.0..=1.0`-ish linear range (whatever the file itself stored).
-#[derive(Clone)]
 pub struct CompositionLayer {
     pub name: String,
     pub size: [usize; 2],
     /// Row-major RGBA pixels, one `[r, g, b, a]` per pixel.
-    ///
-    /// Shared via `Arc` (rather than `Vec`) so that cloning a `Composition`
-    /// to hand off to a background compositing thread is cheap.
     pub pixels: Arc<[[f32; 4]]>,
     pub level: f32,
     /// Applied to this layer's RGB, in order, before it's blended into the
     /// composite.
-    pub filters: Vec<Filter>,
+    pub filters: Vec<FilterEntry>,
 }
 
 impl CompositionLayer {
@@ -100,14 +96,13 @@ const EXCLUDED_LAYER_NAMES: [&str; 3] = [
 ];
 
 /// A stack of decoded EXR layers, ready to be flattened into a single image.
-#[derive(Clone)]
 pub struct Composition {
     pub size: [usize; 2],
     /// Layers in bottom-to-top compositing order, as they appear in the file.
     pub layers: Vec<CompositionLayer>,
     /// Applied to the final composite's RGB, in order, after all layers are
     /// blended together.
-    pub filters: Vec<Filter>,
+    pub filters: Vec<FilterEntry>,
 }
 
 impl Composition {

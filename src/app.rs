@@ -3,82 +3,119 @@ use egui_file_dialog::FileDialog;
 use std::path::Path;
 
 use crate::gpu_compose::GpuCompositor;
-use crate::{Composition, CompositionLayer, Filter, FilterKind};
+use crate::{Composition, FilterEntry};
 
-/// Renders the layer name / level-slider / filter-list table shown above the
-/// image preview. One extra row past `layers.len()` represents the final
-/// composite, whose filters apply after every layer has been blended.
-struct LayerTableDelegate<'a> {
-    layers: &'a mut [CompositionLayer],
-    composite_filters: &'a mut Vec<Filter>,
-    dirty: &'a mut bool,
+/// How tall one "line" of the filter-list cell is: either a run of
+/// collapsed filter chips (+ the "+" menu, if it's the last run), or one
+/// expanded filter's own controls.
+const FILTER_ROW_LINE_HEIGHT: f32 = 30.0;
+
+enum FilterHorizontalRun {
+    Unexpanded {
+        first_filter: usize,
+        num_filters: usize,
+        show_plus: bool,
+    },
+    Expanded {
+        index: usize,
+    },
 }
 
-/// Shows a filter's label and, at the end, a "+" menu button to append a new
-/// filter of a chosen kind. Clicking an existing filter chip does nothing
-/// yet; it's meant to eventually open an editing dialog.
-fn filters_cell_ui(ui: &mut egui::Ui, filters: &mut Vec<Filter>, dirty: &mut bool) {
-    ui.horizontal(|ui| {
-        for filter in filters.iter() {
-            // Not wired up to anything yet; will open an editing dialog.
-            ui.button(filter.kind.label())
-                .on_hover_text("Editing filters isn't supported yet");
-        }
-
-        ui.menu_button("+", |ui| {
-            for kind in FilterKind::ALL {
-                if ui.button(kind.label()).clicked() {
-                    filters.push(Filter::new(kind));
-                    *dirty = true;
-                    ui.close();
-                }
+/// Groups `filters` into UI rows: consecutive collapsed filters share one
+/// row (rendered as a horizontal strip of chips), each expanded filter gets
+/// its own row, and the trailing "+" menu attaches to the last collapsed
+/// run (or gets a row of its own if the list is empty or ends expanded).
+fn layout_filters(filters: &[FilterEntry]) -> Vec<FilterHorizontalRun> {
+    let mut runs = Vec::<FilterHorizontalRun>::new();
+    for (index, entry) in filters.iter().enumerate() {
+        if entry.expanded {
+            runs.push(FilterHorizontalRun::Expanded { index });
+        } else {
+            match runs.last_mut() {
+                Some(FilterHorizontalRun::Unexpanded { num_filters, .. }) => *num_filters += 1,
+                _ => runs.push(FilterHorizontalRun::Unexpanded {
+                    first_filter: index,
+                    num_filters: 1,
+                    show_plus: false,
+                }),
             }
-        });
-    });
-}
-
-impl egui_table::TableDelegate for LayerTableDelegate<'_> {
-    fn header_cell_ui(&mut self, ui: &mut egui::Ui, cell: &egui_table::HeaderCellInfo) {
-        let title = match cell.col_range.start {
-            0 => "Layer",
-            1 => "Level",
-            _ => "Filters",
-        };
-        ui.strong(title);
+        }
     }
 
-    fn cell_ui(&mut self, ui: &mut egui::Ui, cell: &egui_table::CellInfo) {
-        #[expect(clippy::cast_possible_truncation)]
-        let row = cell.row_nr as usize;
-        let is_composite_row = row == self.layers.len();
+    match runs.last_mut() {
+        Some(FilterHorizontalRun::Unexpanded { show_plus, .. }) => *show_plus = true,
+        _ => runs.push(FilterHorizontalRun::Unexpanded {
+            first_filter: 0,
+            num_filters: 0,
+            show_plus: true,
+        }),
+    }
 
-        match cell.col_nr {
-            0 => {
-                if is_composite_row {
-                    ui.strong("Composite");
-                } else if let Some(layer) = self.layers.get(row) {
-                    ui.label(&layer.name);
+    runs
+}
+
+/// The height needed to show `filters`' whole UI: one
+/// [`FILTER_ROW_LINE_HEIGHT`] per row `layout_filters` would produce.
+fn filter_row_height(filters: &[FilterEntry]) -> f32 {
+    #[expect(clippy::cast_precision_loss)]
+    let lines = layout_filters(filters).len() as f32;
+    lines * FILTER_ROW_LINE_HEIGHT
+}
+
+/// Shows each filter as a button (click to expand/collapse its parameter
+/// controls, built by `Filter::make_ui`) plus an "x" to remove it, and, at
+/// the end, a "+" menu button to append a new filter of a chosen kind.
+fn filters_cell_ui(ui: &mut egui::Ui, filters: &mut Vec<FilterEntry>, dirty: &mut bool) {
+    let mut remove = None;
+
+    ui.vertical(|ui| {
+        for run in layout_filters(filters) {
+            match run {
+                FilterHorizontalRun::Unexpanded {
+                    first_filter,
+                    num_filters,
+                    show_plus,
+                } => {
+                    ui.horizontal(|ui| {
+                        for entry in filters.iter_mut().skip(first_filter).take(num_filters) {
+                            if ui.button(entry.filter.label()).clicked() {
+                                entry.expanded = true;
+                            }
+                        }
+                        if show_plus {
+                            ui.menu_button("+", |ui| {
+                                for kind in crate::ALL_KINDS {
+                                    if ui.button(kind.label()).clicked() {
+                                        filters.push(FilterEntry::new(kind.create()));
+                                        *dirty = true;
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                    });
                 }
-            }
-            1 => {
-                if let Some(layer) = self.layers.get_mut(row) {
-                    let slider = ui.add(egui::Slider::new(&mut layer.level, 0.0..=2.0));
-                    if slider.changed() {
-                        *self.dirty = true;
-                    }
-                }
-            }
-            _ => {
-                let filters = if is_composite_row {
-                    Some(&mut *self.composite_filters)
-                } else {
-                    self.layers.get_mut(row).map(|layer| &mut layer.filters)
-                };
-                if let Some(filters) = filters {
-                    filters_cell_ui(ui, filters, self.dirty);
+                FilterHorizontalRun::Expanded { index } => {
+                    ui.horizontal(|ui| {
+                        let entry = &mut filters[index];
+                        if ui.button(entry.filter.label()).clicked() {
+                            entry.expanded = false;
+                        }
+                        if entry.filter.make_ui(ui) {
+                            *dirty = true;
+                        }
+                        if ui.small_button("x").clicked() {
+                            remove = Some(index);
+                        }
+                    });
                 }
             }
         }
+    });
+
+    if let Some(index) = remove {
+        filters.remove(index);
+        *dirty = true;
     }
 }
 
@@ -190,32 +227,61 @@ impl LayerCompositorApp {
             return;
         };
 
-        // +1 for the composite row.
-        let num_rows = comp.layers.len() as u64 + 1;
-        let header_height = 20.0;
-        let row_height = 20.0;
-        #[expect(clippy::cast_precision_loss)]
-        let table_height =
-            (header_height + num_rows as f32 * row_height).clamp(header_height + row_height, 200.0);
+        let mut dirty = false;
 
-        let mut delegate = LayerTableDelegate {
-            layers: &mut comp.layers,
-            composite_filters: &mut comp.filters,
-            dirty: &mut self.composition_dirty,
-        };
+        egui_extras::TableBuilder::new(ui)
+            .id_salt("layer_table")
+            .column(egui_extras::Column::exact(180.0).resizable(true))
+            .column(egui_extras::Column::exact(120.0).resizable(true))
+            .column(egui_extras::Column::remainder().resizable(true))
+            .max_scroll_height(200.0)
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("Layer");
+                });
+                header.col(|ui| {
+                    ui.strong("Level");
+                });
+                header.col(|ui| {
+                    ui.strong("Filters");
+                });
+            })
+            .body(|mut body| {
+                for layer in &mut comp.layers {
+                    let height = filter_row_height(&layer.filters);
+                    body.row(height, |mut row| {
+                        row.col(|ui| {
+                            ui.label(&layer.name);
+                        });
+                        row.col(|ui| {
+                            if ui
+                                .add(egui::Slider::new(&mut layer.level, 0.0..=2.0))
+                                .changed()
+                            {
+                                dirty = true;
+                            }
+                        });
+                        row.col(|ui| {
+                            filters_cell_ui(ui, &mut layer.filters, &mut dirty);
+                        });
+                    });
+                }
 
-        ui.allocate_ui(egui::vec2(ui.available_width(), table_height), |ui| {
-            egui_table::Table::new()
-                .id_salt("layer_table")
-                .num_rows(num_rows)
-                .columns(vec![
-                    egui_table::Column::new(180.0).resizable(true),
-                    egui_table::Column::new(120.0).resizable(true),
-                    egui_table::Column::new(220.0).resizable(true),
-                ])
-                .headers(vec![egui_table::HeaderRow::new(header_height)])
-                .show(ui, &mut delegate);
-        });
+                let height = filter_row_height(&comp.filters);
+                body.row(height, |mut row| {
+                    row.col(|ui| {
+                        ui.strong("Composite");
+                    });
+                    row.col(|_ui| {});
+                    row.col(|ui| {
+                        filters_cell_ui(ui, &mut comp.filters, &mut dirty);
+                    });
+                });
+            });
+
+        if dirty {
+            self.composition_dirty = true;
+        }
     }
 
     /// Shows the composited image, panable by dragging and zoomable with the
@@ -325,12 +391,13 @@ impl eframe::App for LayerCompositorApp {
             egui::MenuBar::new().ui(ui, |ui| {
                 let is_web = cfg!(target_arch = "wasm32");
                 ui.menu_button("File", |ui| {
+                    if ui.button("Open EXR").clicked() {
+                        self.file_dialog.pick_file();
+                    }
+
                     // NOTE: no File->Quit on web pages!
                     if !is_web && ui.button("Quit").clicked() {
                         ui.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    if ui.button("Open EXR").clicked() {
-                        self.file_dialog.pick_file();
                     }
                 });
                 ui.add_space(16.0);
