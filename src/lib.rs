@@ -2,8 +2,10 @@
 
 mod app;
 mod composition;
+mod filters;
 mod gpu_compose;
 
 pub use app::LayerCompositorApp;
 pub use composition::{Composition, CompositionLayer};
+pub use filters::{Filter, FilterKind};
 pub use gpu_compose::GpuCompositor;

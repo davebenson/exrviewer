@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use exr::prelude::*;
 
+use crate::filters::{self, Filter};
+
 /// A single, decoded layer of an EXR file, holding its RGBA pixels as `f32`
 /// samples in `0.0..=1.0`-ish linear range (whatever the file itself stored).
 #[derive(Clone)]
@@ -15,6 +17,9 @@ pub struct CompositionLayer {
     /// to hand off to a background compositing thread is cheap.
     pub pixels: Arc<[[f32; 4]]>,
     pub level: f32,
+    /// Applied to this layer's RGB, in order, before it's blended into the
+    /// composite.
+    pub filters: Vec<Filter>,
 }
 
 impl CompositionLayer {
@@ -77,6 +82,7 @@ impl CompositionLayer {
                     size: [layer.size.0, layer.size.1],
                     pixels: Arc::from(pixels),
                     level: 1.0,
+                    filters: Vec::new(),
                 }
             })
             .collect()
@@ -99,6 +105,9 @@ pub struct Composition {
     pub size: [usize; 2],
     /// Layers in bottom-to-top compositing order, as they appear in the file.
     pub layers: Vec<CompositionLayer>,
+    /// Applied to the final composite's RGB, in order, after all layers are
+    /// blended together.
+    pub filters: Vec<Filter>,
 }
 
 impl Composition {
@@ -125,14 +134,19 @@ impl Composition {
 
         let size = layers.first().map_or([0, 0], |layer| layer.size);
 
-        Ok(Self { size, layers })
+        Ok(Self {
+            size,
+            layers,
+            filters: Vec::new(),
+        })
     }
 
     /// Flattens all layers, bottom to top, using standard "over" alpha
     /// blending, and returns the result as interleaved RGBA8 pixels,
     /// row-major.
     pub fn compose(&self) -> Vec<u8> {
-        let area = self.size[0] * self.size[1];
+        let [width, height] = self.size;
+        let area = width * height;
         let mut result = vec![[0.0_f32; 4]; area];
 
         for layer in &self.layers {
@@ -142,7 +156,16 @@ impl Composition {
                 continue;
             }
 
-            for (out, &[r, g, b, a]) in result.iter_mut().zip(layer.pixels.iter()) {
+            // Filters need the whole layer's RGB up front: several (e.g.
+            // blur) look at neighboring pixels, not just their own.
+            let rgb: Vec<[f32; 3]> = layer.pixels.iter().map(|&[r, g, b, _]| [r, g, b]).collect();
+            let filtered = filters::apply_all_cpu(&layer.filters, width, height, &rgb);
+
+            for ((out, &[.., a]), &[r, g, b]) in result
+                .iter_mut()
+                .zip(layer.pixels.iter())
+                .zip(filtered.iter())
+            {
                 let alpha = a * layer.level;
                 for (out_channel, in_channel) in out.iter_mut().take(3).zip([r, g, b]) {
                     *out_channel = in_channel.mul_add(alpha, *out_channel);
@@ -151,10 +174,19 @@ impl Composition {
             }
         }
 
+        // Clamp before applying composite filters, matching the GPU path
+        // (which can't let HDR values feed a blur before this point either).
+        let clamped: Vec<[f32; 3]> = result
+            .iter()
+            .map(|&[r, g, b, _]| [r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)])
+            .collect();
+        let filtered = filters::apply_all_cpu(&self.filters, width, height, &clamped);
+
         result
-            .into_iter()
-            .flat_map(|pixel| {
-                pixel.map(|value| {
+            .iter()
+            .zip(filtered.iter())
+            .flat_map(|(&[_, _, _, a], &[r, g, b])| {
+                [r, g, b, a].map(|value| {
                     // `round()` of a value clamped to `0.0..=1.0` always fits in a `u8`.
                     #[expect(clippy::cast_possible_truncation)]
                     let byte = (value.clamp(0.0, 1.0) * 255.0).round() as u8;

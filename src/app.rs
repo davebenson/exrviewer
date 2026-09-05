@@ -3,36 +3,80 @@ use egui_file_dialog::FileDialog;
 use std::path::Path;
 
 use crate::gpu_compose::GpuCompositor;
-use crate::{Composition, CompositionLayer};
+use crate::{Composition, CompositionLayer, Filter, FilterKind};
 
-/// Renders the layer name / level-slider table shown above the image preview.
+/// Renders the layer name / level-slider / filter-list table shown above the
+/// image preview. One extra row past `layers.len()` represents the final
+/// composite, whose filters apply after every layer has been blended.
 struct LayerTableDelegate<'a> {
     layers: &'a mut [CompositionLayer],
+    composite_filters: &'a mut Vec<Filter>,
     dirty: &'a mut bool,
+}
+
+/// Shows a filter's label and, at the end, a "+" menu button to append a new
+/// filter of a chosen kind. Clicking an existing filter chip does nothing
+/// yet; it's meant to eventually open an editing dialog.
+fn filters_cell_ui(ui: &mut egui::Ui, filters: &mut Vec<Filter>, dirty: &mut bool) {
+    ui.horizontal(|ui| {
+        for filter in filters.iter() {
+            // Not wired up to anything yet; will open an editing dialog.
+            ui.button(filter.kind.label())
+                .on_hover_text("Editing filters isn't supported yet");
+        }
+
+        ui.menu_button("+", |ui| {
+            for kind in FilterKind::ALL {
+                if ui.button(kind.label()).clicked() {
+                    filters.push(Filter::new(kind));
+                    *dirty = true;
+                    ui.close();
+                }
+            }
+        });
+    });
 }
 
 impl egui_table::TableDelegate for LayerTableDelegate<'_> {
     fn header_cell_ui(&mut self, ui: &mut egui::Ui, cell: &egui_table::HeaderCellInfo) {
-        let title = if cell.col_range.start == 0 {
-            "Layer"
-        } else {
-            "Level"
+        let title = match cell.col_range.start {
+            0 => "Layer",
+            1 => "Level",
+            _ => "Filters",
         };
         ui.strong(title);
     }
 
     fn cell_ui(&mut self, ui: &mut egui::Ui, cell: &egui_table::CellInfo) {
         #[expect(clippy::cast_possible_truncation)]
-        let Some(layer) = self.layers.get_mut(cell.row_nr as usize) else {
-            return;
-        };
+        let row = cell.row_nr as usize;
+        let is_composite_row = row == self.layers.len();
 
-        if cell.col_nr == 0 {
-            ui.label(&layer.name);
-        } else {
-            let slider = ui.add(egui::Slider::new(&mut layer.level, 0.0..=2.0));
-            if slider.changed() {
-                *self.dirty = true;
+        match cell.col_nr {
+            0 => {
+                if is_composite_row {
+                    ui.strong("Composite");
+                } else if let Some(layer) = self.layers.get(row) {
+                    ui.label(&layer.name);
+                }
+            }
+            1 => {
+                if let Some(layer) = self.layers.get_mut(row) {
+                    let slider = ui.add(egui::Slider::new(&mut layer.level, 0.0..=2.0));
+                    if slider.changed() {
+                        *self.dirty = true;
+                    }
+                }
+            }
+            _ => {
+                let filters = if is_composite_row {
+                    Some(&mut *self.composite_filters)
+                } else {
+                    self.layers.get_mut(row).map(|layer| &mut layer.filters)
+                };
+                if let Some(filters) = filters {
+                    filters_cell_ui(ui, filters, self.dirty);
+                }
             }
         }
     }
@@ -139,13 +183,15 @@ impl LayerCompositorApp {
         self.display_texture_id = Some(id);
     }
 
-    /// Shows the layer name / level-slider table, and returns its height.
+    /// Shows the layer name / level-slider / filter-list table. The last row
+    /// is the final composite's own filter list (see `LayerTableDelegate`).
     fn layer_table_ui(&mut self, ui: &mut egui::Ui) {
         let Some(comp) = &mut self.composition else {
             return;
         };
 
-        let num_rows = comp.layers.len() as u64;
+        // +1 for the composite row.
+        let num_rows = comp.layers.len() as u64 + 1;
         let header_height = 20.0;
         let row_height = 20.0;
         #[expect(clippy::cast_precision_loss)]
@@ -154,6 +200,7 @@ impl LayerCompositorApp {
 
         let mut delegate = LayerTableDelegate {
             layers: &mut comp.layers,
+            composite_filters: &mut comp.filters,
             dirty: &mut self.composition_dirty,
         };
 
@@ -164,6 +211,7 @@ impl LayerCompositorApp {
                 .columns(vec![
                     egui_table::Column::new(180.0).resizable(true),
                     egui_table::Column::new(120.0).resizable(true),
+                    egui_table::Column::new(220.0).resizable(true),
                 ])
                 .headers(vec![egui_table::HeaderRow::new(header_height)])
                 .show(ui, &mut delegate);
@@ -300,8 +348,6 @@ impl eframe::App for LayerCompositorApp {
             //if ui.button("Increment").clicked() {
             //self.value += 1.0;
             //}
-
-            ui.separator();
 
             self.file_dialog.update(ui);
 

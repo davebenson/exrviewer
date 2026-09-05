@@ -1,6 +1,11 @@
 // Draws one full-screen triangle per layer, additively blending
 // `layer_rgb * (layer_alpha * layer_level)` into the accumulation target.
 // See gpu_compose.rs for how the blend state completes the formula.
+//
+// `layer_tex` is whichever texture holds this layer's *already filtered*
+// pixels (or its raw pixels, if it has no filters) - see
+// `GpuCompositor::run_filter_chain`. Filters run as their own dedicated
+// passes now, not here.
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,

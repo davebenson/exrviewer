@@ -1,6 +1,11 @@
 // Clamps the (unclamped, HDR-range) accumulated result to `0..=1` and writes
 // it to an 8-bit target for display, matching what the CPU compose path
 // does before quantizing to bytes.
+//
+// Used only when the composite has no filters; when it does, `clamp.wgsl`
+// (same clamp, but to a float target so filters can run afterwards) and
+// `blit.wgsl` (the final float -> display-format copy) bracket the filter
+// chain instead. See `GpuCompositor::compose`.
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,

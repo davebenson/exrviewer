@@ -1,8 +1,8 @@
 //! GPU-accelerated implementation of [`crate::Composition::compose`].
 //!
 //! Each layer's pixels are uploaded to the GPU once, when the file is
-//! loaded. From then on, recompositing is just a couple of render passes
-//! that draw one full-screen quad per layer, so it stays fast regardless of
+//! loaded. From then on, recompositing is just a handful of render passes
+//! that draw one full-screen triangle each, so it stays fast regardless of
 //! how expensive the equivalent CPU loop would be.
 //!
 //! This module only needs a `wgpu::Device`/`Queue`: it doesn't care whether
@@ -11,7 +11,17 @@
 //! setup (a CLI tool, which reads the result back to the CPU via
 //! `read_display_rgba()` to save it to a file).
 //!
-//! ## How it maps to the CPU formula
+//! ## Filters run as their own passes
+//!
+//! Filters (see the `filters` module) can need a whole image, not just a
+//! pixel's own color - `blur` is the obvious example. So each filter is its
+//! own render pass, reading one texture and writing another, rather than
+//! being folded into the accumulate/resolve math. A layer's filter chain
+//! runs (ping-ponging between two scratch textures) before that layer is
+//! blended in; the composite's filter chain runs after blending, on the
+//! clamped result, before the final format conversion for display.
+//!
+//! ## How blending maps to the CPU formula
 //!
 //! The CPU compose loop does, per layer, per pixel:
 //! ```text
@@ -23,16 +33,19 @@
 //! (i.e. premultiplied), and the color target's blend state is
 //! `(One, One, Add)` for both color and alpha, which is exactly the
 //! `out += ...` above. The final `min(_, 1.0)` (and the RGB clamp the CPU
-//! path applies before quantizing to bytes) happens in the resolve pass,
-//! since a floating-point render target doesn't clamp on write the way a
-//! `Unorm` target does.
+//! path applies before running composite filters) happens in the resolve
+//! (or clamp) pass, since a floating-point render target doesn't clamp on
+//! write the way a `Unorm` target does.
 
 const ACCUMULATE_SHADER: &str = include_str!("shaders/accumulate.wgsl");
 const RESOLVE_SHADER: &str = include_str!("shaders/resolve.wgsl");
+const CLAMP_SHADER: &str = include_str!("shaders/clamp.wgsl");
+const BLIT_SHADER: &str = include_str!("shaders/blit.wgsl");
 
-/// The format used for the accumulation target. `Rgba16Float` (unlike
-/// `Rgba32Float`) is guaranteed renderable and blendable on all wgpu
-/// backends without opt-in features.
+/// The format used for layer textures, scratch (filter ping-pong) textures,
+/// and the HDR accumulation target. `Rgba16Float` (unlike `Rgba32Float`) is
+/// guaranteed renderable and blendable on all wgpu backends without opt-in
+/// features.
 const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 /// The format of the final, displayable composite. This matches what
@@ -40,10 +53,21 @@ const ACCUM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 /// encoding), so the two paths look the same.
 const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// One layer's pixels, resident on the GPU.
+fn params_bytes(params: [f32; 4]) -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    for (chunk, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(params) {
+        *chunk = value.to_le_bytes();
+    }
+    bytes
+}
+
+/// One layer's pixels, resident on the GPU, plus a pair of scratch textures
+/// (same size, `ACCUM_FORMAT`) used to run its filter chain, if it has one.
 struct GpuLayer {
-    bind_group: wgpu::BindGroup,
+    raw_view: wgpu::TextureView,
     level_buffer: wgpu::Buffer,
+    scratch_a: wgpu::TextureView,
+    scratch_b: wgpu::TextureView,
 }
 
 /// A composition's GPU-side render targets, rebuilt whenever the canvas size
@@ -51,9 +75,14 @@ struct GpuLayer {
 struct Targets {
     size: [usize; 2],
     accum_view: wgpu::TextureView,
+    /// Wraps `accum_view` with `texture_only_layout`; used by whichever of
+    /// `resolve_pipeline`/`clamp_pipeline` runs.
+    accum_bind_group: wgpu::BindGroup,
+    /// Scratch pair for the composite's own filter chain (canvas-sized).
+    composite_scratch_a: wgpu::TextureView,
+    composite_scratch_b: wgpu::TextureView,
     display_texture: wgpu::Texture,
     display_view: wgpu::TextureView,
-    accum_bind_group: wgpu::BindGroup,
 }
 
 /// Owns the GPU pipelines used to composite layers, plus the per-composition
@@ -63,80 +92,27 @@ pub struct GpuCompositor {
     device: wgpu::Device,
     queue: wgpu::Queue,
     sampler_bind_group: wgpu::BindGroup,
-    layer_bind_group_layout: wgpu::BindGroupLayout,
-    accum_bind_group_layout: wgpu::BindGroupLayout,
+    /// group1 shape `(texture, uniform)`: the accumulate pass (layer
+    /// texture + level) and every filter pass (source texture + params).
+    texture_uniform_layout: wgpu::BindGroupLayout,
+    /// group1 shape `(texture)`: resolve, clamp, and blit, none of which
+    /// take parameters.
+    texture_only_layout: wgpu::BindGroupLayout,
     accumulate_pipeline: wgpu::RenderPipeline,
     resolve_pipeline: wgpu::RenderPipeline,
+    clamp_pipeline: wgpu::RenderPipeline,
+    blit_pipeline: wgpu::RenderPipeline,
+    brightness_pipeline: wgpu::RenderPipeline,
+    invert_pipeline: wgpu::RenderPipeline,
+    blur_pipeline: wgpu::RenderPipeline,
     layers: Vec<GpuLayer>,
     targets: Option<Targets>,
 }
 
 impl GpuCompositor {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        // Layers are composited at their native resolution with no
-        // resampling, so nearest filtering is not just enough but correct.
-        // It also sidesteps needing "filterable float" backend support.
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("exrviewer-compose-sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        let sampler_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("exrviewer-compose-sampler-layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
-                    count: None,
-                }],
-            });
-
-        let sampler_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("exrviewer-compose-sampler-bind-group"),
-            layout: &sampler_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            }],
-        });
-
-        let texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        };
-
-        let layer_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("exrviewer-compose-layer-layout"),
-                entries: &[
-                    texture_entry(0),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let accum_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("exrviewer-compose-accum-layout"),
-                entries: &[texture_entry(0)],
-            });
+        let (sampler_bind_group_layout, sampler_bind_group) = create_sampler(device);
+        let (texture_uniform_layout, texture_only_layout) = create_shared_layouts(device);
 
         let additive_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
@@ -155,17 +131,56 @@ impl GpuCompositor {
             device,
             "accumulate",
             ACCUMULATE_SHADER,
-            &[&sampler_bind_group_layout, &layer_bind_group_layout],
+            &[&sampler_bind_group_layout, &texture_uniform_layout],
             ACCUM_FORMAT,
             Some(additive_blend),
         );
-
         let resolve_pipeline = create_pipeline(
             device,
             "resolve",
             RESOLVE_SHADER,
-            &[&sampler_bind_group_layout, &accum_bind_group_layout],
+            &[&sampler_bind_group_layout, &texture_only_layout],
             DISPLAY_FORMAT,
+            None,
+        );
+        let clamp_pipeline = create_pipeline(
+            device,
+            "clamp",
+            CLAMP_SHADER,
+            &[&sampler_bind_group_layout, &texture_only_layout],
+            ACCUM_FORMAT,
+            None,
+        );
+        let blit_pipeline = create_pipeline(
+            device,
+            "blit",
+            BLIT_SHADER,
+            &[&sampler_bind_group_layout, &texture_only_layout],
+            DISPLAY_FORMAT,
+            None,
+        );
+        let brightness_pipeline = create_pipeline(
+            device,
+            "brightness",
+            crate::filters::BRIGHTNESS_SHADER,
+            &[&sampler_bind_group_layout, &texture_uniform_layout],
+            ACCUM_FORMAT,
+            None,
+        );
+        let invert_pipeline = create_pipeline(
+            device,
+            "invert",
+            crate::filters::INVERT_SHADER,
+            &[&sampler_bind_group_layout, &texture_uniform_layout],
+            ACCUM_FORMAT,
+            None,
+        );
+        let blur_pipeline = create_pipeline(
+            device,
+            "blur",
+            crate::filters::BLUR_SHADER,
+            &[&sampler_bind_group_layout, &texture_uniform_layout],
+            ACCUM_FORMAT,
             None,
         );
 
@@ -173,10 +188,15 @@ impl GpuCompositor {
             device: device.clone(),
             queue: queue.clone(),
             sampler_bind_group,
-            layer_bind_group_layout,
-            accum_bind_group_layout,
+            texture_uniform_layout,
+            texture_only_layout,
             accumulate_pipeline,
             resolve_pipeline,
+            clamp_pipeline,
+            blit_pipeline,
+            brightness_pipeline,
+            invert_pipeline,
+            blur_pipeline,
             layers: Vec::new(),
             targets: None,
         }
@@ -245,7 +265,7 @@ impl GpuCompositor {
             size,
         );
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let raw_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let level_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("exrviewer-layer-level"),
@@ -255,24 +275,13 @@ impl GpuCompositor {
         });
         self.write_level(&level_buffer, layer.level);
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("exrviewer-layer-bind-group"),
-            layout: &self.layer_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: level_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let (scratch_a, scratch_b) = self.create_scratch_pair(width, height);
 
         GpuLayer {
-            bind_group,
+            raw_view,
             level_buffer,
+            scratch_a,
+            scratch_b,
         }
     }
 
@@ -280,6 +289,38 @@ impl GpuCompositor {
         let mut bytes = [0_u8; 16];
         bytes[..4].copy_from_slice(&level.to_le_bytes());
         self.queue.write_buffer(buffer, 0, &bytes);
+    }
+
+    /// Creates a pair of `ACCUM_FORMAT` textures of the given size, for use
+    /// as a filter chain's ping-pong buffers.
+    fn create_scratch_pair(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> (wgpu::TextureView, wgpu::TextureView) {
+        #[expect(clippy::cast_possible_truncation)]
+        let extent = wgpu::Extent3d {
+            width: width as u32,
+            height: height as u32,
+            depth_or_array_layers: 1,
+        };
+
+        let make = || {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("exrviewer-filter-scratch"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: ACCUM_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            texture.create_view(&wgpu::TextureViewDescriptor::default())
+        };
+
+        (make(), make())
     }
 
     fn create_targets(&self, size: [usize; 2]) -> Targets {
@@ -304,12 +345,14 @@ impl GpuCompositor {
 
         let accum_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("exrviewer-accum-bind-group"),
-            layout: &self.accum_bind_group_layout,
+            layout: &self.texture_only_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: wgpu::BindingResource::TextureView(&accum_view),
             }],
         });
+
+        let (composite_scratch_a, composite_scratch_b) = self.create_scratch_pair(size[0], size[1]);
 
         let display_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("exrviewer-display-texture"),
@@ -328,16 +371,137 @@ impl GpuCompositor {
         Targets {
             size,
             accum_view,
+            accum_bind_group,
+            composite_scratch_a,
+            composite_scratch_b,
             display_texture,
             display_view,
-            accum_bind_group,
         }
     }
 
+    fn filter_pipeline(&self, kind: crate::FilterKind) -> &wgpu::RenderPipeline {
+        match kind {
+            crate::FilterKind::Brightness => &self.brightness_pipeline,
+            crate::FilterKind::Invert => &self.invert_pipeline,
+            crate::FilterKind::Blur => &self.blur_pipeline,
+        }
+    }
+
+    /// Runs one full-screen pass: binds `bind_group` (already wrapping
+    /// whatever `pipeline`'s shader needs) at group 1, and renders into
+    /// `dest`.
+    fn run_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        bind_group: &wgpu::BindGroup,
+        dest: &wgpu::TextureView,
+        label: &str,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: dest,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, &self.sampler_bind_group, &[]);
+        pass.set_bind_group(1, bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Runs one filter stage: samples `source`, applies `pipeline` with the
+    /// given `params`, and writes into `dest`.
+    fn run_filter_stage(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        source: &wgpu::TextureView,
+        params: [f32; 4],
+        dest: &wgpu::TextureView,
+    ) {
+        let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("exrviewer-filter-params"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&params_buffer, 0, &params_bytes(params));
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("exrviewer-filter-bind-group"),
+            layout: &self.texture_uniform_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        self.run_pass(
+            encoder,
+            pipeline,
+            &bind_group,
+            dest,
+            "exrviewer-filter-pass",
+        );
+    }
+
+    /// Runs `filters` in order, each as one or more GPU passes (see
+    /// `FilterKind::stage_count`), ping-ponging between `first_dest` and
+    /// `second_dest`. Returns whichever view holds the final result:
+    /// `source` itself if `filters` is empty. `first_dest`/`second_dest`
+    /// must both differ from `source` (they don't need to differ from each
+    /// other in any particular order, just from `source`, so the composite
+    /// chain can pass its own post-clamp buffer as `source` and reuse it as
+    /// `second_dest`).
+    fn run_filter_chain<'v>(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        filters: &[crate::Filter],
+        size: (u32, u32),
+        source: &'v wgpu::TextureView,
+        first_dest: &'v wgpu::TextureView,
+        second_dest: &'v wgpu::TextureView,
+    ) -> &'v wgpu::TextureView {
+        let mut current = source;
+        let mut use_first = true;
+
+        for filter in filters {
+            let pipeline = self.filter_pipeline(filter.kind);
+            for stage in 0..filter.kind.stage_count() {
+                let dest = if use_first { first_dest } else { second_dest };
+                let params = filter.kind.stage_params(filter.amount, stage, size);
+                self.run_filter_stage(encoder, pipeline, current, params, dest);
+                current = dest;
+                use_first = !use_first;
+            }
+        }
+
+        current
+    }
+
     /// Re-runs the composite for the currently loaded layers, using each
-    /// layer's current `level`. The result can be displayed via
-    /// `display_view()` or read back via `read_display_rgba()`. Does
-    /// nothing if nothing has been loaded yet.
+    /// layer's current `level` and filters, plus the composite's own
+    /// filters. The result can be displayed via `display_view()` or read
+    /// back via `read_display_rgba()`. Does nothing if nothing has been
+    /// loaded yet.
     pub fn compose(&mut self, composition: &crate::Composition) {
         let Some(targets) = self.targets.as_ref() else {
             return;
@@ -349,9 +513,8 @@ impl GpuCompositor {
             return;
         }
 
-        for (gpu_layer, layer) in self.layers.iter().zip(composition.layers.iter()) {
-            self.write_level(&gpu_layer.level_buffer, layer.level);
-        }
+        #[expect(clippy::cast_possible_truncation)]
+        let size = (targets.size[0] as u32, targets.size[1] as u32);
 
         let mut encoder = self
             .device
@@ -359,55 +522,140 @@ impl GpuCompositor {
                 label: Some("exrviewer-compose-encoder"),
             });
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("exrviewer-accumulate-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.accum_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.accumulate_pipeline);
-            pass.set_bind_group(0, &self.sampler_bind_group, &[]);
-            for gpu_layer in &self.layers {
-                pass.set_bind_group(1, &gpu_layer.bind_group, &[]);
-                pass.draw(0..3, 0..1);
-            }
-        }
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("exrviewer-resolve-pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.display_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            pass.set_pipeline(&self.resolve_pipeline);
-            pass.set_bind_group(0, &self.sampler_bind_group, &[]);
-            pass.set_bind_group(1, &targets.accum_bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        let layer_sources = self.filter_layers(&mut encoder, composition, size);
+        self.accumulate(&mut encoder, targets, &layer_sources);
+        self.resolve_composite(&mut encoder, targets, composition, size);
 
         self.queue.submit(Some(encoder.finish()));
+    }
+
+    /// Filters each layer (its own passes) before `accumulate` blends the
+    /// result in - can't interleave the two, since a render pass
+    /// exclusively borrows the encoder. Returns each layer's final source
+    /// view (its raw texture, if it has no filters).
+    fn filter_layers(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        composition: &crate::Composition,
+        size: (u32, u32),
+    ) -> Vec<&wgpu::TextureView> {
+        self.layers
+            .iter()
+            .zip(composition.layers.iter())
+            .map(|(gpu_layer, layer)| {
+                self.write_level(&gpu_layer.level_buffer, layer.level);
+                if layer.filters.is_empty() {
+                    &gpu_layer.raw_view
+                } else {
+                    self.run_filter_chain(
+                        encoder,
+                        &layer.filters,
+                        size,
+                        &gpu_layer.raw_view,
+                        &gpu_layer.scratch_a,
+                        &gpu_layer.scratch_b,
+                    )
+                }
+            })
+            .collect()
+    }
+
+    /// Blends each layer's (already filtered) source into `targets.accum_view`.
+    fn accumulate(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &Targets,
+        layer_sources: &[&wgpu::TextureView],
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("exrviewer-accumulate-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &targets.accum_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.accumulate_pipeline);
+        pass.set_bind_group(0, &self.sampler_bind_group, &[]);
+        for (gpu_layer, source) in self.layers.iter().zip(layer_sources.iter()) {
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("exrviewer-layer-bind-group"),
+                layout: &self.texture_uniform_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(source),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: gpu_layer.level_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+
+    /// Clamps the accumulated HDR result and writes the final display
+    /// texture, running the composite's own filter chain in between if it
+    /// has one.
+    fn resolve_composite(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &Targets,
+        composition: &crate::Composition,
+        size: (u32, u32),
+    ) {
+        if composition.filters.is_empty() {
+            self.run_pass(
+                encoder,
+                &self.resolve_pipeline,
+                &targets.accum_bind_group,
+                &targets.display_view,
+                "exrviewer-resolve-pass",
+            );
+            return;
+        }
+
+        self.run_pass(
+            encoder,
+            &self.clamp_pipeline,
+            &targets.accum_bind_group,
+            &targets.composite_scratch_a,
+            "exrviewer-clamp-pass",
+        );
+        let final_view = self.run_filter_chain(
+            encoder,
+            &composition.filters,
+            size,
+            &targets.composite_scratch_a,
+            &targets.composite_scratch_b,
+            &targets.composite_scratch_a,
+        );
+        let blit_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("exrviewer-blit-bind-group"),
+            layout: &self.texture_only_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(final_view),
+            }],
+        });
+        self.run_pass(
+            encoder,
+            &self.blit_pipeline,
+            &blit_bind_group,
+            &targets.display_view,
+            "exrviewer-blit-pass",
+        );
     }
 
     /// Reads the current composite back to the CPU as interleaved RGBA8
@@ -480,6 +728,78 @@ impl GpuCompositor {
 
         Some(rgba)
     }
+}
+
+/// Creates the sampler shared by every pass. Layers are composited at their
+/// native resolution with no resampling, so nearest filtering is not just
+/// enough but correct; it also sidesteps needing "filterable float" backend
+/// support.
+fn create_sampler(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroup) {
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("exrviewer-compose-sampler"),
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("exrviewer-compose-sampler-layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering),
+            count: None,
+        }],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("exrviewer-compose-sampler-bind-group"),
+        layout: &layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Sampler(&sampler),
+        }],
+    });
+
+    (layout, bind_group)
+}
+
+/// Creates the two group-1 layout shapes every pass uses: `(texture,
+/// uniform)` for the accumulate pass and every filter, `(texture)` alone for
+/// resolve/clamp/blit.
+fn create_shared_layouts(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroupLayout) {
+    let texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let uniform_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+
+    let texture_uniform_layout =
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("exrviewer-texture-uniform-layout"),
+            entries: &[texture_entry(0), uniform_entry(1)],
+        });
+    let texture_only_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("exrviewer-texture-only-layout"),
+        entries: &[texture_entry(0)],
+    });
+
+    (texture_uniform_layout, texture_only_layout)
 }
 
 fn create_pipeline(
