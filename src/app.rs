@@ -1,19 +1,9 @@
 /// We derive Deserialize/Serialize so we can persist app state on shutdown.
 use egui_file_dialog::FileDialog;
 use std::path::Path;
-use std::sync::mpsc;
 
+use crate::gpu_compose::GpuCompositor;
 use crate::{Composition, CompositionLayer};
-
-/// The result of a background [`Composition::compose`] run, tagged with the
-/// composition generation it was computed from so stale results (e.g. from a
-/// compose that was still running when a new file was loaded) can be
-/// discarded on arrival.
-struct ComposeResult {
-    rgba: Vec<u8>,
-    size: [usize; 2],
-    generation: u64,
-}
 
 /// Renders the layer name / level-slider table shown above the image preview.
 struct LayerTableDelegate<'a> {
@@ -70,29 +60,24 @@ pub struct LayerCompositorApp {
     #[serde(skip)]
     image_pan: egui::Vec2,
 
-    /// Cached render of `composition.compose()`. Rebuilt only when
-    /// `composition_dirty` is set, so panning/zooming doesn't require
-    /// recompositing every frame.
-    #[serde(skip)]
-    image_texture: Option<egui::TextureHandle>,
-
+    /// Recomposited only when `composition_dirty` is set, so panning/zooming
+    /// doesn't require recompositing every frame.
     #[serde(skip)]
     composition_dirty: bool,
 
-    /// Bumped every time a new file is loaded, to identify (and discard)
-    /// compose results from a previous composition.
+    /// GPU compositor, when a `wgpu` render backend is available (it always
+    /// is natively; see `GpuCompositor` for why this does the actual
+    /// compositing work instead of `Composition::compose`).
     #[serde(skip)]
-    compose_generation: u64,
+    gpu: Option<GpuCompositor>,
 
-    /// Set while a background `compose()` is running. At most one runs at a
-    /// time; if the composition changes again while it's running, we just
-    /// note that with `composition_dirty` and start a new one as soon as
-    /// this one finishes.
+    /// Needed alongside `gpu` to register its output texture with egui for
+    /// display; see `register_display_texture`.
     #[serde(skip)]
-    compose_in_flight: bool,
+    render_state: Option<egui_wgpu::RenderState>,
 
     #[serde(skip)]
-    compose_rx: Option<mpsc::Receiver<ComposeResult>>,
+    display_texture_id: Option<egui::TextureId>,
 }
 
 impl Default for LayerCompositorApp {
@@ -105,11 +90,10 @@ impl Default for LayerCompositorApp {
             composition: None,
             image_zoom: 1.0,
             image_pan: egui::Vec2::ZERO,
-            image_texture: None,
             composition_dirty: false,
-            compose_generation: 0,
-            compose_in_flight: false,
-            compose_rx: None,
+            gpu: None,
+            render_state: None,
+            display_texture_id: None,
         }
     }
 }
@@ -118,12 +102,41 @@ impl LayerCompositorApp {
     fn load_exr(&mut self, path: &Path) {
         match Composition::load_exr(path) {
             Ok(composition) => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.load(&composition);
+                }
                 self.composition = Some(composition);
                 self.composition_dirty = true;
-                self.compose_generation = self.compose_generation.wrapping_add(1);
+                self.register_display_texture();
             }
             Err(error) => log::error!("failed to load {}: {error}", path.display()),
         }
+    }
+
+    /// Registers the GPU compositor's current output texture with egui's
+    /// renderer, so it can be drawn with `ui.painter().image(...)`. Needs
+    /// re-doing (freeing the old id first) whenever `gpu.load()` recreates
+    /// the underlying texture; recomposing into the same texture doesn't
+    /// require it.
+    fn register_display_texture(&mut self) {
+        let (Some(render_state), Some(gpu)) = (&self.render_state, &self.gpu) else {
+            return;
+        };
+        let Some(view) = gpu.display_view() else {
+            return;
+        };
+
+        let mut renderer = render_state.renderer.write();
+        if let Some(old_id) = self.display_texture_id.take() {
+            renderer.free_texture(&old_id);
+        }
+        let id = renderer.register_native_texture(
+            &render_state.device,
+            view,
+            egui_wgpu::wgpu::FilterMode::Nearest,
+        );
+        drop(renderer);
+        self.display_texture_id = Some(id);
     }
 
     /// Shows the layer name / level-slider table, and returns its height.
@@ -157,83 +170,20 @@ impl LayerCompositorApp {
         });
     }
 
-    /// Applies a finished background `compose()` result, if one has arrived.
-    fn poll_compose_result(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.compose_rx else { return };
-
-        match rx.try_recv() {
-            Ok(result) => {
-                self.compose_rx = None;
-                self.compose_in_flight = false;
-
-                // Discard results left over from a composition that has since
-                // been replaced by loading a new file.
-                if result.generation == self.compose_generation {
-                    let color_image =
-                        egui::ColorImage::from_rgba_unmultiplied(result.size, &result.rgba);
-
-                    if let Some(texture) = &mut self.image_texture {
-                        texture.set(color_image, egui::TextureOptions::default());
-                    } else {
-                        self.image_texture = Some(ctx.load_texture(
-                            "my_dynamic_image",
-                            color_image,
-                            egui::TextureOptions::default(),
-                        ));
-                    }
-                }
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.compose_rx = None;
-                self.compose_in_flight = false;
-            }
-        }
-    }
-
-    /// Kicks off a `compose()` on a background thread for the current
-    /// composition. The caller must ensure no other compose is in flight.
-    fn spawn_compose(&mut self, ctx: &egui::Context) {
-        let Some(comp) = self.composition.clone() else {
-            return;
-        };
-
-        let (tx, rx) = mpsc::channel();
-        self.compose_rx = Some(rx);
-        self.compose_in_flight = true;
-        self.composition_dirty = false;
-
-        let generation = self.compose_generation;
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let rgba = comp.compose();
-            let size = comp.size;
-            if tx
-                .send(ComposeResult {
-                    rgba,
-                    size,
-                    generation,
-                })
-                .is_ok()
-            {
-                ctx.request_repaint();
-            }
-        });
-    }
-
     /// Shows the composited image, panable by dragging and zoomable with the
-    /// scroll wheel. Recompositing happens on a background thread; see
-    /// `spawn_compose` and `poll_compose_result`.
+    /// scroll wheel. Recompositing runs on the GPU (see `gpu_compose`), so
+    /// it's cheap enough to just do synchronously whenever dirty.
     fn image_viewer_ui(&mut self, ui: &mut egui::Ui) {
-        self.poll_compose_result(ui.ctx());
-
-        if self.composition_dirty && !self.compose_in_flight {
-            self.spawn_compose(ui.ctx());
-        }
-
         let Some(comp) = &self.composition else {
             return;
         };
+
+        if self.composition_dirty {
+            if let Some(gpu) = &mut self.gpu {
+                gpu.compose(comp);
+            }
+            self.composition_dirty = false;
+        }
 
         let comp_size = egui::vec2(comp.size[0] as f32, comp.size[1] as f32);
         let (rect, response) =
@@ -270,11 +220,11 @@ impl LayerCompositorApp {
             comp_size * self.image_zoom,
         );
 
-        if let Some(texture) = &self.image_texture {
+        if let Some(texture_id) = self.display_texture_id {
             // Clip to `rect` so panning/zooming never paints over the layer
             // list above.
             ui.painter_at(rect).image(
-                texture.id(),
+                texture_id,
                 image_rect,
                 egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
@@ -291,11 +241,22 @@ impl LayerCompositorApp {
 
         // Load previous app state (if any).
         // Note that you must enable the `persistence` feature for this to work.
-        if let Some(storage) = cc.storage {
+        let mut app: Self = if let Some(storage) = cc.storage {
             eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default()
         } else {
             Default::default()
-        }
+        };
+
+        // `gpu`/`render_state` are always skipped by serde, so this has to
+        // happen after loading/defaulting the rest of the state above, not
+        // inside it.
+        app.render_state = cc.wgpu_render_state.clone();
+        app.gpu = app
+            .render_state
+            .as_ref()
+            .map(|rs| GpuCompositor::new(&rs.device, &rs.queue));
+
+        app
     }
 }
 

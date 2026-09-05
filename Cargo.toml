@@ -23,6 +23,10 @@ serde = { version = "1.0.219", features = ["derive"] }
 exr = "1.74.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 egui_table = "0.10.0"
+egui-wgpu = "0.36.0"
+half = "2"
+wgpu = "30.0.0"
+pollster = "0.3"
 
 # native:
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
