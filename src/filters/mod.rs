@@ -21,6 +21,7 @@ mod brightness;
 mod invert;
 mod bw;
 mod spiral;
+mod fisheye;
 
 /// A stateless descriptor for a *type* of filter: enough to list it in an
 /// "add filter" menu (`label`), build its GPU pipeline once (`shader`), and
@@ -71,6 +72,7 @@ pub const ALL_KINDS: &[&dyn FilterKind] = &[
     &invert::Invert,
     &blur::Blur,
     &bw::BW,
+    &fisheye::Fisheye,
     &spiral::Spiral,
 ];
 

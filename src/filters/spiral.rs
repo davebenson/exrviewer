@@ -64,7 +64,7 @@ impl Filter for SpiralFilter {
     }
 
     fn make_ui(&mut self, ui: &mut egui::Ui) -> bool {
-        let mut widgets = [
+        let widgets = [
           egui::Slider::new(&mut self.center_x, 0.0..=1.0).text("X"),
           egui::Slider::new(&mut self.center_y, 0.0..=1.0).text("Y"),
           egui::Slider::new(&mut self.twist, 0.0..=MAX_TWIST).text("Twist"),
