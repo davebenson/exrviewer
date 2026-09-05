@@ -21,7 +21,7 @@ impl FilterKind for Fisheye {
         Box::new(FisheyeFilter {
             center_x: 0.5,
             center_y: 0.5,
-            power: 1.0
+            power: DEFAULT_POWER,
         })
     }
 }
@@ -46,22 +46,29 @@ impl Filter for FisheyeFilter {
     }
 
     fn apply_cpu(&self, width: usize, height: usize, rgb: &[[f32; 3]]) -> Vec<[f32; 3]> {
-        fisheye_pass(&rgb, width, height, self.center_x, self.center_y, self.power)
+        fisheye_pass(
+            &rgb,
+            width,
+            height,
+            self.center_x,
+            self.center_y,
+            self.power,
+        )
     }
 
     fn make_ui(&mut self, ui: &mut egui::Ui) -> bool {
         let widgets = [
-          egui::Slider::new(&mut self.center_x, 0.0..=1.0).text("X"),
-          egui::Slider::new(&mut self.center_y, 0.0..=1.0).text("Y"),
-          egui::Slider::new(&mut self.power, MIN_POWER..=MAX_POWER).text("Power"),
+            egui::Slider::new(&mut self.center_x, 0.0..=1.0).text("X"),
+            egui::Slider::new(&mut self.center_y, 0.0..=1.0).text("Y"),
+            egui::Slider::new(&mut self.power, MIN_POWER..=MAX_POWER).text("Power"),
         ];
         let mut changed = false;
         ui.vertical(|ui| {
-          for widget in widgets {
-           if ui.add(widget).changed() {
-               changed = true;
-           }
-          }
+            for widget in widgets {
+                if ui.add(widget).changed() {
+                    changed = true;
+                }
+            }
         });
         changed
     }
@@ -73,7 +80,7 @@ fn fisheye_pass(
     height: usize,
     center_x: f32,
     center_y: f32,
-    power: f32
+    power: f32,
 ) -> Vec<[f32; 3]> {
     let mut out = vec![[0.0_f32; 3]; src.len()];
     let (width_i, height_i) = (width.cast_signed(), height.cast_signed());

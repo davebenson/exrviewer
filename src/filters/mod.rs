@@ -18,10 +18,10 @@
 
 mod blur;
 mod brightness;
-mod invert;
 mod bw;
-mod spiral;
 mod fisheye;
+mod invert;
+mod spiral;
 
 /// A stateless descriptor for a *type* of filter: enough to list it in an
 /// "add filter" menu (`label`), build its GPU pipeline once (`shader`), and

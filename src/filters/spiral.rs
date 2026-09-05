@@ -60,23 +60,31 @@ impl Filter for SpiralFilter {
     }
 
     fn apply_cpu(&self, width: usize, height: usize, rgb: &[[f32; 3]]) -> Vec<[f32; 3]> {
-        spiral_pass(&rgb, width, height, self.center_x, self.center_y, self.twist, self.angle_scale)
+        spiral_pass(
+            &rgb,
+            width,
+            height,
+            self.center_x,
+            self.center_y,
+            self.twist,
+            self.angle_scale,
+        )
     }
 
     fn make_ui(&mut self, ui: &mut egui::Ui) -> bool {
         let widgets = [
-          egui::Slider::new(&mut self.center_x, 0.0..=1.0).text("X"),
-          egui::Slider::new(&mut self.center_y, 0.0..=1.0).text("Y"),
-          egui::Slider::new(&mut self.twist, 0.0..=MAX_TWIST).text("Twist"),
-          egui::Slider::new(&mut self.angle_scale, 0.0..=MAX_ANGLE_SCALE).text("Angle Scale")
+            egui::Slider::new(&mut self.center_x, 0.0..=1.0).text("X"),
+            egui::Slider::new(&mut self.center_y, 0.0..=1.0).text("Y"),
+            egui::Slider::new(&mut self.twist, 0.0..=MAX_TWIST).text("Twist"),
+            egui::Slider::new(&mut self.angle_scale, 0.0..=MAX_ANGLE_SCALE).text("Angle Scale"),
         ];
         let mut changed = false;
         ui.vertical(|ui| {
-          for widget in widgets {
-           if ui.add(widget).changed() {
-               changed = true;
-           }
-          }
+            for widget in widgets {
+                if ui.add(widget).changed() {
+                    changed = true;
+                }
+            }
         });
         changed
     }
@@ -89,7 +97,7 @@ fn spiral_pass(
     center_x: f32,
     center_y: f32,
     twist: f32,
-    angle_scale: f32
+    angle_scale: f32,
 ) -> Vec<[f32; 3]> {
     let mut out = vec![[0.0_f32; 3]; src.len()];
     let (width_i, height_i) = (width.cast_signed(), height.cast_signed());
